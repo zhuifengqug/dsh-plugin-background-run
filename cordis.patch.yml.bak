@@ -1,0 +1,6 @@
+# @gjs27/dsh-plugin-background-run bundle patch.
+# Auto-applied when the package is installed with
+# `dsh plugin --profile <name> add <package>`.
+- insert:
+    - id: background-run
+      name: '@gjs27/dsh-plugin-background-run'

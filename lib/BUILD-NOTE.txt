@@ -1,0 +1,1 @@
+宿主侧 lib/*.js 由 scripts/build.mjs 从 src/*.ts 经类型剥离生成（Node 内置，无外部构建依赖）。
