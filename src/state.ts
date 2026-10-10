@@ -39,6 +39,18 @@ export interface BackgroundRunStatusSnapshot {
   lastError?: string;
   /** 电源后端不可用时的原因说明。 */
   backendNote?: string;
+  /**
+   * 只读打点：本进程收到的 `agent/status` 事件数。
+   *
+   * 用途（需求 §4 B8）：目标宿主把 `agent/status` 列为 scope-filtered 事件，
+   * 对未 scoped 的插件 fiber 是否投递未经验证。该计数为 0 即证明事件被过滤，
+   * 必须改走 `agent/created` 或周期对账；> 0 则说明当前订阅方式可用。
+   */
+  agentStatusEvents: number;
+  /** 只读打点：本进程收到的 jobs 订阅事件数（验证 subscribe 是否真的接通）。 */
+  jobEvents: number;
+  /** 只读打点：是否成功绑定到 id 等于 `background-run` 的 Loader 条目（false = 正在用默认值 false）。 */
+  settingsBound: boolean;
 }
 
 export interface RefCountDriver {

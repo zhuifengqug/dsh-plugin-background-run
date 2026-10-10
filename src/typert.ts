@@ -8,15 +8,18 @@
  * 方法（declaration order = wire order，需与 status-controller.ts 的
  * markRemote 顺序一致）：
  * - status：只读快照（电源保持 / 当前任务 / 网络状态）；
- * - getSettings：读开关真实值（浏览器 settingsScope 看不见外部命名空间时的兜底）；
- * - updateSettings：写开关（走宿主 scope.update()，与 watch 同一数据源）。
+ * - getSettings：读开关真实值（客户端 configForms 不可用时的兜底）；
+ * - updateSettings：写开关（走宿主 settings.update(ns, patch)，与 configForms 同一落盘位置）。
+ *
+ * 0.2.0 适配：删除 `__diag` 输入字段（配套的 TEMP-DIAG 回传链路已按需求 §4 B11 移除）；
+ * status 快照新增三个只读打点字段（agentStatusEvents / jobEvents / settingsBound），
+ * 供目标宿主验证 agent/status 的 scope 投递、jobs 订阅与本插件的条目绑定状态。
+ * 三个方法名与顺序未变，因此 status-controller.ts 的 markRemote 列表与客户端的
+ * REMOTE_CONTRIBUTION 仍逐字对齐。
  */
 import { z } from 'zod';
 
-const emptyInput = z.object({
-  // TEMP-DIAG: 允许客户端捎带诊断串（status 是只读方法，字段仅用于日志回传）
-  __diag: z.string().max(4000).optional(),
-}).strict();
+const emptyInput = z.object({}).strict();
 
 const statusSchema = z.object({
   state: z.enum(['disabled', 'enabled-idle', 'active', 'network-interrupted', 'error']),
@@ -28,6 +31,9 @@ const statusSchema = z.object({
   networkOnline: z.boolean(),
   lastError: z.string().optional(),
   backendNote: z.string().optional(),
+  agentStatusEvents: z.number().int().nonnegative(),
+  jobEvents: z.number().int().nonnegative(),
+  settingsBound: z.boolean(),
 }).strict();
 
 const settingsValueSchema = z.object({

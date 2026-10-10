@@ -1,0 +1,7 @@
+# pnpm 11 起，安装期设置从 package.json 的 `pnpm` 字段迁到本文件（package.json 里的
+# `pnpm` 字段会被忽略并告警）。koffi 是原生 FFI 模块，必须执行其安装脚本才能就位；
+# 未批准时 `pnpm install` 以 ERR_PNPM_IGNORED_BUILDS 退出（exit 1），并连带阻断
+# `pnpm run <script>` 的 verify-deps-before-run 预检（typecheck 根本跑不到 tsc）。
+# 只批准本插件依赖的这一个包。
+allowBuilds:
+  koffi: true

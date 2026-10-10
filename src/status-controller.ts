@@ -1,15 +1,19 @@
 /**
  * 浏览器侧开关读写 + 状态读取通道（Typert Remote）。
  *
- * 开关写入优先走标准 settings 通道（浏览器 settingsScope -> remote.settings.mutate）。
- * 但实测浏览器 settingsScope 只 serve 白名单命名空间，外部插件命名空间在浏览器侧
- * 不可见（image-gen 的 scope 是宿主直连特例，不可复制）。因此本控制器额外暴露
- * getSettings / updateSettings 两个薄方法（at-file 同款 Remote 直连模式），
- * 作为设置页面的读写兜底：读宿主侧真实值，写宿主侧 scope.update()。
+ * 开关写入的**主通道**是客户端的 `ctx.configForms.get('background-run')`
+ * （DSH 0.1.7-rc.2 起 `settingsScope` 更名为 `configForms`，见 client/client.js）；
+ * 本控制器额外暴露 getSettings / updateSettings 两个薄方法（at-file 同款 Remote
+ * 直连模式），作为设置页面的**兜底**通道：读宿主侧真实值，写宿主侧
+ * `settings.update(ns, patch)`（0.2.0-rc.2 的 SettingsForms 命名空间级写入，
+ * 落盘到 profile 的 cordis.patch.yml 里该 entry 的 config）。
  * status() 仍是只读快照，供页面展示电源保持 / 当前任务 / 网络状态。
  *
  * Remote 注册用 myrules 同款 markRemote() 写法：plain-JS，无装饰器，
  * 与当前 @deepseek-ai/dsh-typert-protocol 的 markers 表直接兼容。
+ *
+ * 0.2.0 适配：删除原 TEMP-DIAG 分支（它把客户端字符串无条件追加写进
+ * `D:/DSHData/home/background-run-diag.log`，属写宿主目录的硬编码路径，需求 §4 B11）。
  */
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import type { Context } from '@deepseek-ai/cordis';
@@ -39,14 +43,6 @@ export class BackgroundRunStatusController extends TypertRemoteService {
   }
 
   async status(_input: Record<string, unknown> = {}): Promise<BackgroundRunStatusWire> {
-    // TEMP-DIAG: 客户端诊断回传（只读副作用：仅写日志文件，不改任何状态）
-    try {
-      const diag = (_input as { __diag?: unknown } | undefined)?.__diag;
-      if (typeof diag === 'string' && diag.length > 0 && diag.length < 4000) {
-        const { appendFileSync } = await import('node:fs');
-        appendFileSync('D:/DSHData/home/background-run-diag.log', `${new Date().toISOString()} ${diag}\n`);
-      }
-    } catch { /* 诊断失败不影响主流程 */ }
     void _input;
     const service = this.ctx.get('backgroundRun' as never) as
       | { snapshot(): BackgroundRunSnapshot }
@@ -60,13 +56,16 @@ export class BackgroundRunStatusController extends TypertRemoteService {
         runningAgents: 0,
         runningJobs: 0,
         networkOnline: true,
+        agentStatusEvents: 0,
+        jobEvents: 0,
+        settingsBound: false,
         lastError: '后台运行服务未加载。',
       };
     }
     return service.snapshot();
   }
 
-  /** 读宿主侧开关真实值（浏览器 settingsScope 不可见外部命名空间时的兜底）。 */
+  /** 读宿主侧开关真实值（客户端 configForms 不可用时的兜底）。 */
   async getSettings(_input: Record<string, unknown> = {}): Promise<BackgroundRunSettingsResult> {
     void _input;
     const service = this.ctx.get('backgroundRun' as never) as
@@ -76,7 +75,7 @@ export class BackgroundRunStatusController extends TypertRemoteService {
     return { ok: true, value: { backgroundRunEnabled: enabled }, writable: true };
   }
 
-  /** 写宿主侧开关（走宿主 scope.update()，与设置页 watch 同一数据源）。 */
+  /** 写宿主侧开关（走宿主 settings.update(ns, patch)，与设置页 configForms 同一落盘位置）。 */
   async updateSettings(_input: Record<string, unknown> = {}): Promise<BackgroundRunUpdateResult> {
     const input = (_input ?? {}) as { field?: unknown; value?: unknown; backgroundRunEnabled?: unknown };
     // 兼容两种调用形状：{ field, value }（at-file 同款）或 { backgroundRunEnabled }。
@@ -106,7 +105,8 @@ export class BackgroundRunStatusController extends TypertRemoteService {
       };
     }
     try {
-      // settings.update(ns, patch)：走持久化写入队列，watch 回调会同步 enabled。
+      // settings.update(ns, patch)：走宿主持久化写入队列（profile 的 cordis.patch.yml
+      // 里该 entry 的 config），插件侧下一次 syncEnabled 对账即读到新值。
       await scope.update(BACKGROUND_RUN_SETTINGS_NAMESPACE, { backgroundRunEnabled: next });
     } catch (error) {
       return {

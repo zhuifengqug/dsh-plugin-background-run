@@ -1,6 +1,6 @@
 {
   "name": "@gjs27/dsh-plugin-background-run",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DSH Windows 后台运行插件：显示器关闭时保持任务运行，任务期间阻止系统睡眠（SetThreadExecutionState，仅 ES_SYSTEM_REQUIRED，不碰显示器）",
   "license": "MIT",
   "type": "module",
@@ -38,23 +38,32 @@
   "scripts": {
     "build": "node ./scripts/build.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node --test test/state.test.mjs test/power.test.mjs test/plugin-lifecycle.test.mjs && echo [host-harness] run: node --test test/host-harness.test.mjs  (from a profile dir that resolves @deepseek-ai/cordis)"
+    "test": "node --test test/state.test.mjs test/power.test.mjs test/plugin-lifecycle.test.mjs test/config.test.mjs test/network.test.mjs test/jobs.test.mjs",
+    "test:host": "node --test test/host-harness.test.mjs"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-settings": "^0.1.5-rc.1 || ^0.1.6-alpha.1 || ^0.1.7-alpha.1 || ^0.1.7-rc.1",
-    "@deepseek-ai/dsh-agent": "^0.1.5-rc.1 || ^0.1.6-alpha.1 || ^0.1.7-alpha.1 || ^0.1.7-rc.1",
-    "@deepseek-ai/dsh-jobs": "^0.1.5-rc.1 || ^0.1.6-alpha.1 || ^0.1.7-alpha.1 || ^0.1.7-rc.1",
-    "@deepseek-ai/schemastery": "^3.18.2",
-    "@deepseek-ai/dsh-typert-protocol": "^0.1.5-rc.1 || ^0.1.6-alpha.1 || ^0.1.7-alpha.1 || ^0.1.7-rc.1"
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-settings": "^0.1.0 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-agent": "^0.1.0 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-jobs": "^0.1.0 || ^0.2.0-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "@deepseek-ai/dsh-typert-protocol": "^0.1.0 || ^0.2.0-rc.1"
   },
   "optionalDependencies": {
     "koffi": "^3.1.0"
   },
-  "devDependencies": {
-    "typescript": "^5.6.0"
-  },
   "dependencies": {
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-jobs": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-settings": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "@types/node": "^22.20.0",
+    "koffi": "^3.1.0",
+    "typescript": "^5.8.0"
   }
 }

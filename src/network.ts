@@ -21,16 +21,53 @@ export interface NetworkMonitorOptions {
   timeoutMs?: number;
   /** 探测域名（仅 DNS，不传输任务数据）。 */
   probeHost?: string;
+  /**
+   * 探测实现（默认 `node:dns/promises` 的 lookup）。
+   *
+   * 可注入是为了让超时语义可回归：注入一个永不 settle 的实现，
+   * 断言 `probeOnce()` 在 `timeoutMs` 内返回 `offline`（需求 §4 B12）。
+   */
+  lookup?: (host: string) => Promise<unknown>;
 }
 
 const DEFAULT_INTERVAL_MS = 30_000;
 const DEFAULT_TIMEOUT_MS = 8_000;
 const DEFAULT_PROBE_HOST = 'api.deepseek.com';
 
+/**
+ * 带显式超时的 DNS 探测。
+ *
+ * 为什么不用 `dns.lookup(host, { signal })`：`signal` 不在 Node 的
+ * `LookupOptions` 里（`@types/node` 全文无 `signal` 字段），运行时也被忽略 ——
+ * 实测预先 abort 的 signal 仍会正常 resolve，8s 超时保护等于不存在。
+ * 因此改为 `Promise.race` + 显式定时器，超时语义真实生效且可测试。
+ */
+export async function lookupWithTimeout(
+  host: string,
+  timeoutMs: number,
+  lookup: (host: string) => Promise<unknown>,
+): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      lookup(host).then(() => undefined),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`DNS 探测超时（${timeoutMs} ms）`));
+        }, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export class NetworkMonitor {
   private readonly intervalMs: number;
   private readonly timeoutMs: number;
   private readonly probeHost: string;
+  private readonly lookup: (host: string) => Promise<unknown>;
   private readonly onChange: (online: boolean) => void;
   private readonly onLog: (message: string) => void;
   private timer: NodeJS.Timeout | undefined;
@@ -43,6 +80,7 @@ export class NetworkMonitor {
     this.intervalMs = options?.intervalMs ?? DEFAULT_INTERVAL_MS;
     this.timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.probeHost = options?.probeHost ?? DEFAULT_PROBE_HOST;
+    this.lookup = options?.lookup ?? ((host: string) => dns.lookup(host));
   }
 
   get isOnline(): boolean {
@@ -69,7 +107,7 @@ export class NetworkMonitor {
   async probeOnce(): Promise<NetworkProbeResult> {
     let next: NetworkProbeResult;
     try {
-      await dns.lookup(this.probeHost, { signal: AbortSignal.timeout(this.timeoutMs) });
+      await lookupWithTimeout(this.probeHost, this.timeoutMs, this.lookup);
       next = 'online';
     } catch {
       next = 'offline';

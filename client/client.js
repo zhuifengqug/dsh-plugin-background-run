@@ -1,10 +1,18 @@
 /* DSH 后台运行插件 - 浏览器侧设置页面（左侧导航独立入口，仿 dsh-myrules）。
- * ModuleLoader 工厂格式。开关写入走标准 settings 通道，
- * 状态展示走宿主侧 backgroundRunStatus 只读快照。
+ * ModuleLoader 工厂格式。开关读写主通道是 `ctx.configForms.get('background-run')`
+ * （0.1.7-rc.2 起 `settingsScope` 更名为 `configForms`），
+ * 状态展示走宿主侧 backgroundRunStatus 只读快照（Remote）。
  *
  * 注册 settings.section（id `background-run`）：设置页左侧导航出现「后台运行」，
  * 点进去是整页开关 + 实时状态（电源保持 / 当前任务 / 后台任务 / 网络）。
  * 不再注册 settings.plugin.item，避免与「插件」页卡片重复。
+ *
+ * 0.2.0 适配（需求 §4）：
+ * - B4：写开关走 `form.mutate([{op:'set', path:['backgroundRunEnabled'], …}])`
+ *   （**多段路径数组**；`.set(field, value)` 把 field 当单段会被宿主静默拒写），
+ *   并从 form 快照的 **user 原始层** 回读确认；
+ * - B5：strict codec 改为 `create()` 工厂；`$mount` 加 8s 超时兜底；
+ * - B11：删除 `diagLog` / `diagNote` / `__diag` 诊断回传链路。
  */
 window.__ModuleLoader__.load({
   id: '@gjs27/dsh-plugin-background-run',
@@ -143,8 +151,36 @@ window.__ModuleLoader__.load({
     // contribution；stock DSH remote bundle 不认识本插件的自定义命名空间。
     // 三个方法与宿主 TYPERT invocations 一一对应（顺序一致）：
     // status / getSettings / updateSettings。
+    // 0.2.0（需求 §4 B5）：strict codec **必须**是 create 工厂。
+    // 宿主 requireStrictCodec 检查的是 `typeof codec.create === 'function'`
+    // （dsh-typert-loader/lib/index.js:208-211）；旧的 { mode, typeSymbol, schema }
+    // 写法会让 remote.$mount() 既不 resolve 也不 reject，界面永远停在「正在连接」。
+    // 真正的 strict 校验由宿主侧 src/typert.ts 的 zod schema 负责，这里只做透传。
     function passthroughCodec(typeSymbol) {
-      return { mode: 'strict', typeSymbol: typeSymbol, schema: { parse: function (value) { return value; } } };
+      return {
+        mode: 'strict',
+        typeSymbol: typeSymbol,
+        create: function () {
+          return {
+            parse: function (value) { return value; },
+            safeParse: function (value) { return { success: true, data: value }; },
+          };
+        },
+      };
+    }
+    // $mount 的挂起上限：不合规贡献可能永不 settle（见上），必须自己兜底。
+    var MOUNT_TIMEOUT_MS = 8000;
+    function withTimeout(promise, timeoutMs) {
+      if (!promise || typeof promise.then !== 'function') return promise;
+      return Promise.race([
+        promise,
+        new Promise(function (_resolve, reject) {
+          var timer = setTimeout(function () {
+            reject(new Error('remote.$mount 超时（' + timeoutMs + ' ms）'));
+          }, timeoutMs);
+          if (timer && timer.unref) timer.unref();
+        }),
+      ]);
     }
     function descriptor(method, inputSymbol, resultSymbol) {
       return {
@@ -210,31 +246,26 @@ window.__ModuleLoader__.load({
         live: null,
       };
     }
-    function Controller(ctx, scope, remotes) {
+    // 0.2.0（需求 §4 B4）：第三参数仍是 Remote 兜底通道；第二参数由
+    // `ctx.settingsScope.bind()` 换成 `ctx.configForms.get()` 得到的 ConfigForm。
+    // 快照形状 `{ status, value, base, user, revision, writable, mode }`。
+    function Controller(ctx, form, remotes) {
       this.ctx = ctx;
-      this.scope = scope || null;
+      this.form = form || null;
       this.remotes = remotes;
       this.store = createCardStore(createInitialState());
       this.disposed = false;
       this.pollTimer = undefined;
       var self = this;
       this.unsubscribe = null;
-      this.diagLog = [];
-      this.diagNote = function (msg) {
+      if (this.form && typeof this.form.subscribe === 'function') {
         try {
-          self.diagLog.push(String(msg).slice(0, 300));
-          if (self.diagLog.length > 24) self.diagLog.splice(0, self.diagLog.length - 24);
-        } catch (e) { /* ignore */ }
-      };
-      this.diagNote('ctor host=' + (typeof location !== 'undefined' ? location.host : '?') + ' scope=' + (scope ? 'yes' : 'NULL') + ' remotes.updateSettings=' + (typeof (remotes && remotes.updateSettings)) + ' remotes.getSettings=' + (typeof (remotes && remotes.getSettings)));
-      if (this.scope && typeof this.scope.subscribe === 'function') {
-        try {
-          this.unsubscribe = this.scope.subscribe(function () { self.deriveFromScope(); });
+          this.unsubscribe = this.form.subscribe(function () { self.deriveFromForm(); });
         } catch (e) {
           this.unsubscribe = null;
         }
       }
-      this.deriveFromScope();
+      this.deriveFromForm();
       this.reloadSettings();
       this.refreshLive();
       this.pollTimer = setInterval(function () {
@@ -243,20 +274,19 @@ window.__ModuleLoader__.load({
       }, 5000);
       if (this.pollTimer && this.pollTimer.unref) this.pollTimer.unref();
     }
-    // settingsScope 可用时：标准通道派生开关（image-gen 同款 scope 语义）。
-    Controller.prototype.deriveFromScope = function () {
+    // configForms 可用时：标准通道派生开关（宿主会随写入/热重载推送新快照）。
+    Controller.prototype.deriveFromForm = function () {
       if (this.disposed) return;
-      if (!this.scope || typeof this.scope.getSnapshot !== 'function') return;
+      if (!this.form || typeof this.form.getSnapshot !== 'function') return;
       var snap;
       try {
-        snap = this.scope.getSnapshot();
+        snap = this.form.getSnapshot();
       } catch (e) {
         return;
       }
       var prev = this.store.getSnapshot();
       if (snap.status === 'ready') {
         var value = snap.value || {};
-        this.diagNote('derive: scope=ready value=' + JSON.stringify(value).slice(0, 120) + ' writable=' + (snap.writable === true) + ' => enabled=' + (value.backgroundRunEnabled === true) + ' (prev.enabled=' + prev.enabled + ')');
         this.store.set({
           settingsStatus: 'ready',
           enabled: value.backgroundRunEnabled === true,
@@ -265,19 +295,16 @@ window.__ModuleLoader__.load({
         });
       } else if (snap.status === 'loading') {
         // 还在加载：保持 loading，不吞掉 Remote 兜底已拿到的值。
-        this.diagNote('derive: scope=loading (prev.settingsStatus=' + prev.settingsStatus + ', prev.enabled=' + prev.enabled + ')' + (prev.settingsStatus !== 'ready' ? ' => RESET enabled=false' : ' => skip'));
         if (prev.settingsStatus !== 'ready') {
           this.store.set({ settingsStatus: 'loading', enabled: false, writable: false, saving: false, saveFailed: false });
         }
-      } else {
-        this.diagNote('derive: scope=' + snap.status + ' (skip)');
       }
-      // 其它状态：不动，等 Remote 兜底（reloadSettings）决定。
+      // 其它状态（unavailable 等）：不动，等 Remote 兜底（reloadSettings）决定。
       // 注意：derive 绝不主动把 ready 打回 loading/unavailable ——
-      // 之前版本里 scope 短暂抖动会吞掉已拿到的开关值，导致“未启用 + 保存失败”假象。
+      // 之前版本里 form 短暂抖动会吞掉已拿到的开关值，导致“未启用 + 保存失败”假象。
     };
     // Remote 兜底（at-file 同款模式）：经 backgroundRunStatus 的
-    // getSettings 读宿主侧真实值；settingsScope 缺失/不可写时这是主通道。
+    // getSettings 读宿主侧真实值；configForms 不可用/未 ready 时这是兜底通道。
     Controller.prototype.reloadSettings = function () {
       var self = this;
       if (this.disposed) return Promise.resolve();
@@ -285,25 +312,20 @@ window.__ModuleLoader__.load({
       if (!remote || typeof remote.getSettings !== 'function') return Promise.resolve();
       try {
         return remote.getSettings().then(function (res) {
-          if (self.disposed || !res) { self.diagNote('reload: res=' + JSON.stringify(res).slice(0, 100)); return; }
+          if (self.disposed || !res) return;
           // 解开 RPC 信封 {ok, value} → 业务结果 {ok, value:{backgroundRunEnabled}, writable}
           var business = unwrapEnvelope(res);
-          if (business && typeof business === 'object' && business.ok === false) {
-            self.diagNote('reload: business ok=false ' + JSON.stringify(business.error || {}).slice(0, 120));
-            return;
-          }
+          if (business && typeof business === 'object' && business.ok === false) return;
           var value = business && business.value !== undefined ? business.value : business;
-          if (!value || typeof value !== 'object') { self.diagNote('reload: bad value=' + JSON.stringify(res).slice(0, 120)); return; }
-          self.diagNote('reload: ok value=' + JSON.stringify(value).slice(0, 100) + ' => enabled=' + (value.backgroundRunEnabled === true));
+          if (!value || typeof value !== 'object') return;
           self.store.set({
             settingsStatus: 'ready',
             enabled: value.backgroundRunEnabled === true,
             writable: business && business.writable !== undefined ? business.writable !== false : true,
             saving: false,
           });
-        }).catch(function (e) { self.diagNote('reload: REJECTED ' + errText(e).slice(0, 160)); });
+        }).catch(function () { /* 兜底通道失败不打断开关，保留 configForms 的值 */ });
       } catch (e) {
-        self.diagNote('reload: SYNC THROW ' + errText(e).slice(0, 120));
         return Promise.resolve();
       }
     };
@@ -311,22 +333,42 @@ window.__ModuleLoader__.load({
       var self = this;
       var snap = this.store.getSnapshot();
       if (snap.settingsStatus !== 'ready' || !snap.writable || snap.saving) {
-        self.diagNote('toggle: IGNORED status=' + snap.settingsStatus + ' writable=' + snap.writable + ' saving=' + snap.saving);
         return Promise.resolve();
       }
       var prevEnabled = snap.enabled;
       var next = !prevEnabled;
-      this.diagNote('toggle: START prev=' + prevEnabled + ' next=' + next);
       this.store.set({ enabled: next, saving: true, saveFailed: false, saveError: null });
-      // 优先标准通道（settingsScope），不可用时走 Remote 兜底。
-      var p = null;
-      if (this.scope && typeof this.scope.set === 'function') {
+      // 主通道（需求 §4 B4/B9）：configForms.mutate + **多段路径数组**。
+      // ConfigForm.set(field, value) 内部是 mutate([{op:'set', path:[field], …}])，
+      // 把 field 整个当作**一个**路径段；宿主按 schema.dict['a.b'] 查表必然查不到，
+      // 于是**静默拒写**（返回 false，不抛错）。所以这里显式给出 path 数组，
+      // 并在写后从 **user 原始层** 回读确认（继承值恰好相等不算写入成功）。
+      var formReady = false;
+      if (this.form && typeof this.form.mutate === 'function') {
         try {
-          p = this.scope.set('backgroundRunEnabled', next);
-          this.diagNote('toggle: channel=scope.set (promise)');
+          var formSnap = this.form.getSnapshot();
+          formReady = !!formSnap && formSnap.status === 'ready' && formSnap.writable !== false;
+        } catch (e) {
+          formReady = false;
+        }
+      }
+      var p = null;
+      if (formReady) {
+        try {
+          p = this.form.mutate([{ op: 'set', path: ['backgroundRunEnabled'], value: next }]).then(function (acceptedByHost) {
+            var landed = null;
+            try { landed = self.form.getSnapshot(); } catch (e) { landed = null; }
+            var userLayer = landed && landed.user;
+            var inUserLayer = !!(userLayer && typeof userLayer === 'object' && userLayer.backgroundRunEnabled === next);
+            if (acceptedByHost === false || !inUserLayer) {
+              // 宿主明确拒绝（revision 冲突 / 字段非 volatile / 条目未绑定）时
+              // 必须把原因显示出来，不能让开关自己弹回去却没有任何解释。
+              throw new Error('宿主拒绝写入 backgroundRunEnabled（revision 冲突或字段不可写）');
+            }
+            return landed;
+          });
         } catch (e) {
           p = null;
-          this.diagNote('toggle: scope.set SYNC THROW ' + errText(e).slice(0, 140));
         }
       }
       if (!p && this.remotes && typeof this.remotes.updateSettings === 'function') {
@@ -337,41 +379,33 @@ window.__ModuleLoader__.load({
             if (business && typeof business === 'object' && business.ok === false) {
               throw new Error((business.error && business.error.message) || 'update failed');
             }
-            self.diagNote('toggle: updateSettings business=' + JSON.stringify(business).slice(0, 140));
             return business;
           });
-          this.diagNote('toggle: channel=remote.updateSettings');
         } catch (e) {
           p = null;
-          this.diagNote('toggle: updateSettings SYNC THROW ' + errText(e).slice(0, 140));
         }
       }
       if (!p) {
-        this.diagNote('toggle: NO CHANNEL => instant revert');
         if (!self.disposed) self.store.set({ enabled: prevEnabled, saving: false, saveFailed: true, saveError: null });
         return Promise.resolve();
       }
       return p.then(function () {
         if (self.disposed) return;
-        self.diagNote('toggle: write promise RESOLVED (next=' + next + ')');
         self.store.set({ saving: false, saveFailed: false, saveError: null });
-        // 以宿主侧真实值为准（两种通道都重新拉一次）。
-        if (self.scope && typeof self.scope.getSnapshot === 'function') {
+        // 以宿主侧真实值为准（configForms 优先，Remote 兜底再拉一次）。
+        if (self.form && typeof self.form.getSnapshot === 'function') {
           try {
-            var landed = self.scope.getSnapshot();
+            var landed = self.form.getSnapshot();
             if (landed && landed.status === 'ready') {
               var landedValue = (((landed.value || {}).backgroundRunEnabled) === true);
-              self.diagNote('toggle: landed scope ready value=' + JSON.stringify(landed.value).slice(0, 100) + ' landedValue=' + landedValue);
               if (landedValue !== next) {
-                // 镜像还没追上写操作（revision  fence）：等 mirror 回放再定，
+                // 镜像还没追上写操作（revision fence）：等 mirror 回放再定，
                 // 先保持乐观值，别立刻打脸用户。
                 self.reloadSettings();
                 self.refreshLive();
                 return;
               }
               self.store.set({ enabled: landedValue });
-            } else {
-              self.diagNote('toggle: landed scope status=' + (landed && landed.status));
             }
           } catch (e) { /* 忽略，用 Remote 校验 */ }
         }
@@ -379,7 +413,6 @@ window.__ModuleLoader__.load({
         self.refreshLive();
       }).catch(function (e) {
         if (self.disposed) return;
-        self.diagNote('toggle: write promise REJECTED ' + errText(e).slice(0, 200));
         self.store.set({ enabled: prevEnabled, saving: false, saveFailed: true, saveError: errText(e) });
       });
     };
@@ -389,16 +422,8 @@ window.__ModuleLoader__.load({
       var remote = self.remotes;
       if (!remote || typeof remote.status !== 'function') return Promise.resolve();
       try {
-        var diagPayload;
-        if (self.diagLog && self.diagLog.length > 0) {
-          diagPayload = self.diagLog.splice(0, self.diagLog.length).join(' | ');
-        }
-        var snap = this.store.getSnapshot();
-        var input = {};
-        if (diagPayload) {
-          input.__diag = 'store[' + snap.settingsStatus + ' enabled=' + snap.enabled + ' writable=' + snap.writable + '] ' + diagPayload;
-        }
-        return remote.status(input).then(function (live) {
+        // 0.2.0（需求 §4 B11）：不再捎带 __diag 诊断串（宿主侧的回传落盘链路已删除）。
+        return remote.status({}).then(function (live) {
           if (self.disposed) return;
           // 解开 RPC 信封 {ok, value} → 状态快照
           var snapshot = unwrapEnvelope(live);
@@ -505,10 +530,11 @@ window.__ModuleLoader__.load({
 
     // ── plugin face ─────────────────────────────────────────────────────
     // 对齐 pixel-skin：settings.section 左侧导航入口。不再注册 settings.plugin.item。
-    // inject 只用壳里一定存在的 slots/locale/remote 三件套（pixel-skin 同款），
-    // 开关读写先走 settingsScope（标准通道），缺失时降级走 Remote（经 index.ts
-    // 里新增的 getSettings/updateSettings 方法），两种路都拿到快照后进同一个 store。
-    var inject = ['slots', 'locale', 'remote'];
+    // inject 用壳里存在的 slots/locale/remote 三件套 + `configForms`
+    // （DSH 0.1.7-rc.2 起 `settingsScope` 更名为 `configForms`，见需求 §4 B4）。
+    // 开关读写主通道走 configForms，缺失时降级走 Remote（经 index.ts 的
+    // getSettings/updateSettings 兜底方法），两条路都进同一个 store。
+    var inject = ['slots', 'locale', 'remote', 'configForms'];
     function apply(ctx) {
       ctx.locale.register(NS, { zh: zh, en: en });
       tRef = ctx.locale.bind(NS);
@@ -516,7 +542,9 @@ window.__ModuleLoader__.load({
       var settingsRemote = null;
       var mountP = null;
       try {
-        mountP = ctx.remote.$mount(REMOTE_CONTRIBUTION);
+        // 超时兜底：不合规的 contribution 会让 $mount 既不 resolve 也不 reject，
+        // 没有上限时状态区永远停在「正在连接」。
+        mountP = withTimeout(ctx.remote.$mount(REMOTE_CONTRIBUTION), MOUNT_TIMEOUT_MS);
       } catch (e) {
         mountP = null;
       }
@@ -539,15 +567,17 @@ window.__ModuleLoader__.load({
       if (mountP && typeof mountP.then === 'function') {
         mountP.then(afterMount).catch(function () { /* 状态通道不可用时降级显示，开关不受影响 */ });
       }
-      var scope = null;
+      // 命名空间 = Loader 条目 id（dsh-settings 以 entries() 的 options.id 匹配）；
+      // 因此该插件的 profile 条目 id 必须恰好是 'background-run'。
+      var form = null;
       try {
-        if (ctx.settingsScope && typeof ctx.settingsScope.bind === 'function') {
-          scope = ctx.settingsScope.bind({ namespace: SETTINGS_NS });
+        if (ctx.configForms && typeof ctx.configForms.get === 'function') {
+          form = ctx.configForms.get(SETTINGS_NS);
         }
       } catch (e) {
-        scope = null;
+        form = null;
       }
-      var controller = new Controller(ctx, scope, {
+      var controller = new Controller(ctx, form, {
         status: function (input) {
           if (remoteStatus) return remoteStatus.status(input);
           return Promise.resolve(null);
