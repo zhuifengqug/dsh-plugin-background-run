@@ -1,0 +1,7 @@
+# @gjs27/dsh-plugin-background-run@0.2.0 bundle patch.
+# The profile keeps the feature disabled until the user enables the setting.
+- insert:
+    - id: background-run
+      name: '@gjs27/dsh-plugin-background-run'
+      config:
+        backgroundRunEnabled: false
