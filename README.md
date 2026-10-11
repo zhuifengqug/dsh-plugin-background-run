@@ -62,9 +62,9 @@ DSH 宿主已原生实现「关闭桌面窗口后任务继续在后台运行，�
 ## 任务检测（复用现有事件）
 
 - 当前任务：`agent/status`（idle ⇄ running，覆盖流式模型请求与工具调用全程）。
-- 后台任务：`ctx.jobs.subscribe(ctx, { owners: 'all' }, listener)` 事件驱动
-  （`registered` / `stopping` / `settled` / `removed` …），
-  并以 `jobs.list()` 快照差分作**唯一可信兜底**（订阅缺失或漏事件时仍正确）。
+- 后台任务：目标 DSH 0.2.0-rc.2 使用 `ctx.jobs.events.subscribe(filter, listener)` 事件驱动；旧宿主形状 `jobs.subscribe(ctx, filter, listener)` 仅作为兼容回退。
+  事件包括 `registered` / `stopping` / `settled` / `removed` 等；
+  同时以 `jobs.list()` 快照差分作**唯一可信兜底**（订阅缺失或漏事件时仍正确）。
   活跃态 = `running | stopping`，终止态 = `completed | killed | failed`；
   `removed` 与「从 list 中消失」都收口，避免计数泄漏。
 - 定时任务（dsh-schedule）：触发后走 agent turn，已被 `agent/status` 覆盖，不单独计数。
@@ -78,7 +78,7 @@ DSH 宿主已原生实现「关闭桌面窗口后任务继续在后台运行，�
 |---|---|
 | `settingsBound` | 是否绑定到 id = `background-run` 的 Loader 条目（false = 正在用默认值 false） |
 | `agentStatusEvents` | 本进程收到的 `agent/status` 事件数（0 = 事件被 scope 过滤，需改订阅方式） |
-| `jobEvents` | 本进程收到的 jobs 订阅事件数（0 = `subscribe` 未接通） |
+| `jobEvents` | 本进程收到的 jobs 订阅事件数（0 = `events.subscribe` 未接通） |
 
 ## 电源保持策略
 
@@ -95,26 +95,62 @@ DSH 宿主已原生实现「关闭桌面窗口后任务继续在后台运行，�
 
 ## 安装（profile）
 
-```sh
-dsh plugin --profile web add <插件目录或包名>
+### 源码目录准备
+
+本插件包自身声明了 `dsh.bundle.patch`，会插入 Host 条目 `background-run`；客户端由包的
+`dsh.client.platform: web` 元数据加载。源码目录首次接入前，在插件目录安装依赖：
+
+```powershell
+cd D:\dsh-workspaces\dev\local-plugins\dsh-plugin-background-run
+pnpm install
 ```
 
-然后在 `profiles/<profile>/cordis.patch.yml` 里确保存在该条目（id 必须是 `background-run`）：
+### 安装到 profile
+
+使用 DSH 插件管理器安装插件目录（不要手改 profile 的 `package.json`、lockfile 或
+`cordis.patch.yml`）：
+
+```text
+目标：D:\dsh-workspaces\dev\local-plugins\dsh-plugin-background-run
+Profile：desktop
+```
+
+插件管理器会把本地插件加入 profile 的 bundle 列表和依赖锁定，并应用其
+`cordis.patch.yml`。默认条目配置为：
 
 ```yaml
 - insert:
     - id: background-run
       name: '@gjs27/dsh-plugin-background-run'
-    - id: background-run-status
-      name: '@gjs27/dsh-plugin-background-run/status-controller'
-    - id: ui-background-run
-      name: '@gjs27/dsh-plugin-background-run/client'
+      config:
+        backgroundRunEnabled: false
 ```
+
+条目 id 必须恰好是 `background-run`。Host 入口会自行挂载
+`backgroundRunStatus`，无需额外插入 Remote 行；Web 客户端由 `dsh.client` 元数据加载，
+无需额外插入 client 行。
+
+### desktop profile 本次接入状态
+
+本仓库的 `0.2.0` 已接入本机 desktop profile，默认开关为 `false`。接入提交为
+`cc2f797`，插件适配提交为 `62cc03269b00c72c06ab35b3c763a800cfb40c57`。
+安装或替换插件后需要重启 DSH Desktop，当前会话不会自动加载新的 Host/Client 模块。
 
 依赖可见性：`zod` / `koffi` 由本包自身依赖提供，`@deepseek-ai/*`（含 `schemastery`、
 `cordis`、`dsh-settings`、`dsh-agent`、`dsh-jobs`、`dsh-typert-protocol`）由 profile 的宿主 cohort 提供。
-从源码目录以 `link:` 方式接入时，请先在本插件目录执行 `pnpm install`，
-否则运行时依赖不在解析链上（电源后端会降级为 `unsupported` 并在快照里给 `backendNote`）。
+如果使用源码 `link:` 接入，必须先在本插件目录执行 `pnpm install`，否则电源后端可能降级为
+`unsupported` 并在快照里给出 `backendNote`。
+
+### 回滚
+
+优先在插件仓库执行追加式回滚，不改写历史：
+
+```powershell
+git revert --no-commit 62cc032
+```
+
+如果只需要暂时停用，可在插件管理器中禁用该 bundle；彻底移除由插件管理器执行。不要手动删除
+desktop profile 的依赖、锁文件或 composition 行。
 
 ## 开发与验证
 
@@ -139,6 +175,17 @@ pnpm test:host        # 真实 Cordis Context 集成测试（需 @deepseek-ai/* 
 6. 任务结束后状态回到空闲，`powercfg /requests` 不再有本插件的 SYSTEM 请求。
 7. 关闭开关 → 不再申请；卸载插件 → 无残留（定时器与电源请求均清零）。
 
+## 已验证结果与残余边界
+
+本地验证：`pnpm run typecheck`、`pnpm run build`、`pnpm test`（48/48）和
+`pnpm test:host`（18/18）均通过。目标 DSH `0.2.0-rc.2` / Node `v24.21.0` 的临时 profile
+复验确认 Loader entry `state=2`、`settingsBound=true`、`jobs.events.subscribe` 生效，
+任务期间 `runningJobs/activeTasks=1`、`powerHeld=true`，任务结束后计数归零并完成 teardown。
+
+仍需在真实 desktop 会话中由用户验收：设置页开关读写回读、提升权限后的
+`powercfg /requests`、显示器关闭/锁屏长任务、Typert 按包名自动发现、`agent/status` scope
+事件、完整桌面 HMR/readiness 和卸载清理。`powercfg` 未提升权限时的 exit 1 不代表插件失败。
+
 ## 版本与变更日志
 
 - 插件版本与 DSH 宿主版本是**两个独立坐标**：插件 `0.2.0` ≠ 宿主 `0.2.0-rc.2`。
@@ -152,7 +199,7 @@ pnpm test:host        # 真实 Cordis Context 集成测试（需 @deepseek-ai/* 
   持久化从 `$DSH_HOME/settings.yaml` 迁到 profile 的 `cordis.patch.yml`，
   **旧值不会自动迁移**（新装后默认 `false`）。
 - **任务计数**：`ctx.jobs.onJobsChanged/onJobDone` 与 `JobSnapshot` 在目标宿主全库无命中，
-  改为 `jobs.subscribe(...)` 事件驱动 + `jobs.list()` 差分兜底，按 `status` 判定活跃态。
+  改为 `jobs.events.subscribe(...)` 事件驱动（旧宿主形状仅作兼容回退）+ `jobs.list()` 差分兜底，按 `status` 判定活跃态。
 - **客户端**：`ctx.settingsScope` → `ctx.configForms`（`ConfigForm`），
   写开关改走 `mutate([{ op:'set', path:['backgroundRunEnabled'], … }])` 并从 user 层回读。
 - **Remote**：客户端 strict codec 补齐 `create()` 工厂；`$mount` 加 8s 超时兜底。
